@@ -12,20 +12,20 @@ Use this skill to set up a clean worktree workflow, create new worktrees, and gu
 ## Workflow Decision Tree
 
 1) **Is the request issue-based?**
-
 - Yes → Use `references/hosting.md` to fetch issue details (MCP → gh → glab → manual).
 - No → Continue with the task description.
 
 2) **Is the repo layout already `main/` + `worktrees/`?**
-
 - Yes → Work from `main/`.
 - No → Recommend migration and offer to run `scripts/migrate_to_main_layout.sh`.
 
-3) **Create a worktree** using the naming rules in `references/workflow.md`.
+3) **Run preflight checks** (clean tree, base branch, existing worktrees) using `references/workflow.md`.
 
-4) **Implement the task** in the worktree, then review with the user.
+4) **Create a worktree** using the naming rules in `references/workflow.md`.
 
-5) **Finish**: merge or open a PR/MR, then clean up worktrees and branches.
+5) **Implement the task** in the worktree, then review with the user.
+
+6) **Finish**: merge or open a PR/MR, then clean up worktrees and branches.
 
 ## Required Checks
 

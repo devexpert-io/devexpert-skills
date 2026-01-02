@@ -26,6 +26,34 @@ Manual steps:
 2. Create `main/` and `worktrees/`
 3. Move `.git` and all project files into `main/`
 
+## Preflight checks
+
+Before creating a worktree, verify:
+
+- The working tree is clean
+- You know the base branch
+- You aren’t duplicating an existing worktree
+
+Commands (from `main/`):
+```
+# Clean working tree
+
+git status --porcelain
+
+# Base branch (prefer remote default)
+
+git symbolic-ref refs/remotes/origin/HEAD | sed 's@^refs/remotes/origin/@@'
+
+# Existing worktrees
+
+git worktree list
+```
+
+If you have a remote configured, fetch updates:
+```
+git fetch origin
+```
+
 ## Branch and directory naming
 
 - Issue-based: `issue-<id>-<slug>`
