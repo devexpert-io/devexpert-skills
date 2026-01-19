@@ -26,33 +26,16 @@ worktree-helper/scripts/migrate_to_main_layout.sh <repo-root>
 
 If the layout is already in place, continue in `main/`.
 
-## 3) Preflight checks
+## 3) Determine base branch
 
-Run from `main/`:
-
+Default: `main`.
+If remote exists, try to detect:
 ```
-# 1) Ensure clean working tree
-
-git status --porcelain
-
-# 2) Determine base branch (prefer remote default if available)
-
 git symbolic-ref refs/remotes/origin/HEAD | sed 's@^refs/remotes/origin/@@'
-
-# 3) If a remote exists, fetch updates
-
-git remote -v
-
-git fetch origin
-
-# 4) List existing worktrees to avoid duplicates
-
-git worktree list
 ```
-
-If the working tree is not clean, ask the user to commit or stash changes first.
-If `origin/HEAD` is missing, fall back to `main` or `master` if present.
-If no remote exists, skip fetch.
+Fallbacks:
+- If local `main` exists, use it.
+- Else if `master` exists, use it.
 
 ## 4) Naming
 

@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+import argparse
+import json
+from pathlib import Path
+
+from slack_common import api_call, get_token
+
+
+def _load_inbox(path):
+    inbox_path = Path(path)
+    if not inbox_path.exists():
+        raise SystemExit(f"Inbox JSON not found: {inbox_path}")
+    with inbox_path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _find_item(items, index):
+    for item in items:
+        if item.get("index") == index:
+            return item
+    raise SystemExit(f"No item with index {index} in inbox JSON")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Mark Slack conversation as read")
+    parser.add_argument("--index", type=int, required=True, help="Index from slack-inbox list")
+    parser.add_argument("--inbox", default="/tmp/slack-inbox.json", help="Path to inbox JSON")
+    args = parser.parse_args()
+
+    token = get_token()
+    items = _load_inbox(args.inbox)
+    item = _find_item(items, args.index)
+
+    channel_id = item.get("id")
+    ts = item.get("latest_ts")
+    if not channel_id or not ts:
+        raise SystemExit("Missing channel id or latest ts")
+
+    api_call("conversations.mark", token, {"channel": channel_id, "ts": ts})
+    print(f"Marked as read: {item.get('name')}")
+
+
+if __name__ == "__main__":
+    main()

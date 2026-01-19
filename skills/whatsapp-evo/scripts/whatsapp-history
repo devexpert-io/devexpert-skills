@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+import argparse
+import datetime
+import json
+from pathlib import Path
+
+from whatsapp_common import (
+    api_call,
+    extract_text_from_message,
+    get_base_url,
+    get_instance,
+    get_token,
+    normalize_number_from_jid,
+)
+
+
+def _load_inbox(path: str) -> list:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        raise SystemExit("Inbox JSON not found. Run whatsapp-inbox first.")
+    except json.JSONDecodeError:
+        raise SystemExit("Inbox JSON is invalid. Re-run whatsapp-inbox.")
+
+
+def _find_by_index(items: list, index: int) -> dict:
+    for item in items:
+        if isinstance(item, dict) and item.get("index") == index:
+            return item
+    raise SystemExit(f"Index {index} not found in inbox JSON.")
+
+
+def _parse_iso(value: str) -> str:
+    if not value:
+        return ""
+    raw = value.strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        dt = datetime.datetime.fromisoformat(raw)
+    except Exception:
+        raise SystemExit("Invalid date. Use ISO format like 2025-01-13 or 2025-01-13T10:30:00Z")
+    return dt.isoformat()
+
+
+def _ts_to_dt(ts) -> str:
+    try:
+        return datetime.datetime.fromtimestamp(int(ts)).isoformat(sep=" ", timespec="seconds")
+    except Exception:
+        return ""
+
+
+def _resolve_target(args) -> tuple[str, str]:
+    target = args.number.strip() or args.jid.strip()
+    label = ""
+    if not target and args.index:
+        items = _load_inbox(args.inbox)
+        entry = _find_by_index(items, args.index)
+        target = entry.get("remote_jid") or entry.get("number") or ""
+        label = entry.get("name") or ""
+    if not target:
+        raise SystemExit("Missing target. Provide --jid/--number or use --index with inbox JSON.")
+    return target, label
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Fetch WhatsApp history via Evolution API")
+    parser.add_argument("--index", type=int, default=0)
+    parser.add_argument("--jid", default="")
+    parser.add_argument("--number", default="")
+    parser.add_argument("--inbox", default="/tmp/whatsapp-inbox.json")
+    parser.add_argument("--limit", type=int, default=50)
+    parser.add_argument("--page", type=int, default=1)
+    parser.add_argument("--since", default="")
+    parser.add_argument("--until", default="")
+    parser.add_argument("--incoming-only", action="store_true")
+    parser.add_argument("--json-out", default="")
+    parser.add_argument("--instance", default="")
+    parser.add_argument("--url", default="")
+    args = parser.parse_args()
+
+    token = get_token()
+    base_url = args.url.strip() or get_base_url()
+    instance = args.instance.strip() or get_instance()
+
+    target, label = _resolve_target(args)
+
+    payload = {
+        "where": {"key": {"remoteJid": target}},
+        "offset": args.limit,
+        "page": args.page,
+    }
+
+    if args.since or args.until:
+        message_timestamp = {}
+        if args.since:
+            message_timestamp["gte"] = _parse_iso(args.since)
+        if args.until:
+            message_timestamp["lte"] = _parse_iso(args.until)
+        payload["where"]["messageTimestamp"] = message_timestamp
+
+    response = api_call("POST", base_url, f"/chat/findMessages/{instance}", token, payload=payload)
+    records = response.get("messages", {}).get("records", [])
+    if not records:
+        print("No messages found")
+        return
+
+    out = []
+    for record in records:
+        key = record.get("key", {})
+        from_me = key.get("fromMe")
+        if args.incoming_only and from_me:
+            continue
+
+        remote_jid = key.get("remoteJid") or ""
+        text = extract_text_from_message(record.get("message", {})) or ""
+        if not text:
+            text = "(sin texto)"
+
+        timestamp = record.get("messageTimestamp")
+        sender = record.get("pushName") or ("Yo" if from_me else normalize_number_from_jid(remote_jid))
+        status = None
+        updates = record.get("MessageUpdate") or []
+        if isinstance(updates, list) and updates:
+            status = updates[-1].get("status")
+
+        line = f"{_ts_to_dt(timestamp)} | {sender}: {text}"
+        if status:
+            line += f" [{status}]"
+        print(line)
+
+        out.append(
+            {
+                "id": record.get("id"),
+                "remote_jid": remote_jid,
+                "from_me": from_me,
+                "sender": sender,
+                "text": text,
+                "message_timestamp": timestamp,
+                "status": status,
+            }
+        )
+
+    if args.json_out:
+        Path(args.json_out).parent.mkdir(parents=True, exist_ok=True)
+        with open(args.json_out, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "target": target,
+                    "label": label,
+                    "limit": args.limit,
+                    "page": args.page,
+                    "messages": out,
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+
+
+if __name__ == "__main__":
+    main()

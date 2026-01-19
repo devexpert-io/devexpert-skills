@@ -1,0 +1,114 @@
+{
+  "rules": [
+    {
+      "name": "Amazon.es listo para recogida",
+      "from_contains": "Amazon.es",
+      "subject_contains_any": [
+        "Listo para recogida",
+        "Listo para la recogida"
+      ],
+      "action": "open"
+    },
+    {
+      "name": "ThriveCart Order Bot",
+      "from_contains": "ThriveCart Order Bot",
+      "action": "archive"
+    },
+    {
+      "name": "Postiz",
+      "from_contains": "Postiz",
+      "action": "archive"
+    },
+    {
+      "name": "LinkedIn",
+      "from_contains": "LinkedIn",
+      "action": "archive"
+    },
+    {
+      "name": "DevExpert Enrolled User",
+      "from_contains": "DevExpert",
+      "subject_contains": "Notification: Enrolled User",
+      "action": "archive"
+    },
+    {
+      "name": "Ticket Digital Mercadona",
+      "from_contains": "Ticket Digital Mercadona",
+      "action": "archive"
+    },
+    {
+      "name": "Fullpilates Coslada",
+      "from_contains": "Fullpilates Coslada",
+      "action": "archive"
+    },
+    {
+      "name": "Banca/finanzas",
+      "from_contains_any": [
+        "ING",
+        "BBVA",
+        "Santander",
+        "Caixa",
+        "CaixaBank",
+        "Bankinter",
+        "Sabadell",
+        "Revolut",
+        "Wise",
+        "PayPal"
+      ],
+      "action": "open"
+    },
+    {
+      "name": "Facturas/Impuestos",
+      "subject_contains_any": [
+        "factura",
+        "invoice",
+        "impuesto",
+        "IVA",
+        "IRPF",
+        "retención",
+        "modelo ",
+        "hacienda"
+      ],
+      "action": "open"
+    },
+    {
+      "name": "Alertas/Errores/Incidentes",
+      "subject_contains_any": [
+        "alert",
+        "alerta",
+        "error",
+        "failure",
+        "failed",
+        "incident",
+        "down",
+        "outage",
+        "abuse",
+        "crit",
+        "critical",
+        "kritisch"
+      ],
+      "action": "open"
+    },
+    {
+      "name": "Promos/Newsletters",
+      "subject_contains_any": [
+        "newsletter",
+        "oferta",
+        "descuento",
+        "promo",
+        "promoción",
+        "%",
+        "ahorra",
+        "rebajas",
+        "aprovecha",
+        "no te pierdas"
+      ],
+      "action": "archive"
+    },
+    {
+      "name": "Amazon.es",
+      "from_contains": "Amazon.es",
+      "action": "archive"
+    }
+  ],
+  "default_action": "review"
+}

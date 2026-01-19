@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+import argparse
+import imaplib
+import json
+import os
+import re
+import subprocess
+from getpass import getpass
+from pathlib import Path
+
+ICLOUD_HOST = "imap.mail.me.com"
+ICLOUD_PORT = 993
+
+def _run(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+def _load_inbox(path):
+    inbox_path = Path(path)
+    if not inbox_path.exists():
+        raise SystemExit(f"Inbox JSON not found: {inbox_path}")
+    with inbox_path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+def _find_item(items, index):
+    for item in items:
+        if item.get("index") == index:
+            return item
+    raise SystemExit(f"No item with index {index} in inbox JSON")
+
+def _parse_list_response(line: bytes):
+    try:
+        decoded = line.decode("utf-8", errors="replace")
+    except Exception:
+        decoded = str(line)
+
+    flags = []
+    if "(" in decoded and ")" in decoded:
+        flags_part = decoded.split("(", 1)[1].split(")", 1)[0]
+        flags = [f for f in flags_part.split() if f]
+
+    quoted = re.findall(r'"((?:\\.|[^"])*)"', decoded)
+    if quoted:
+        name = quoted[-1]
+    else:
+        parts = decoded.split()
+        name = parts[-1] if parts else ""
+        if name.startswith('"') and name.endswith('"'):
+            name = name[1:-1]
+
+    return flags, name
+
+def _list_mailboxes(m):
+    typ, data = m.list()
+    if typ != "OK":
+        return []
+    mailboxes = []
+    for line in data or []:
+        flags, name = _parse_list_response(line)
+        if not name:
+            continue
+        mailboxes.append((flags, name))
+    return mailboxes
+
+def _find_archive_mailbox(m):
+    mailboxes = _list_mailboxes(m)
+    if not mailboxes:
+        return None, mailboxes
+
+    for flags, name in mailboxes:
+        if "\\\\Archive" in flags:
+            return name, mailboxes
+
+    candidates = [
+        "Archive",
+        "INBOX/Archive",
+        "INBOX.Archive",
+        "Archivados",
+        "INBOX/Archivados",
+        "INBOX.Archivados",
+        "Archivo",
+        "INBOX/Archivo",
+        "INBOX.Archivo",
+        "Archived",
+        "INBOX/Archived",
+        "INBOX.Archived",
+    ]
+    lower_map = {name.lower(): name for _, name in mailboxes}
+    for cand in candidates:
+        found = lower_map.get(cand.lower())
+        if found:
+            return found, mailboxes
+
+    return None, mailboxes
+
+def _parse_indices(values):
+    indices = []
+    for raw in values or []:
+        for part in str(raw).split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if not part.isdigit():
+                raise SystemExit(f"Invalid index: {part}")
+            indices.append(int(part))
+    if not indices:
+        raise SystemExit("At least one --index is required")
+    return indices
+
+def _archive_gmail(item):
+    account = item.get("account")
+    thread_id = item.get("id")
+    if not account or not thread_id:
+        raise SystemExit("Missing account or thread id in inbox item")
+
+    cmd = [
+        "gog",
+        "gmail",
+        "thread",
+        "modify",
+        "--account",
+        account,
+        thread_id,
+        "--remove",
+        "INBOX",
+    ]
+    res = _run(cmd)
+    if res.returncode != 0:
+        raise SystemExit(res.stderr.strip() or res.stdout.strip())
+
+    print(f"Archived thread {thread_id} for {account}")
+
+def _archive_icloud(account, uids, mailbox_arg):
+    icloud_pass = os.environ.get("ICLOUD_APP_PASSWORD")
+    if not icloud_pass:
+        icloud_pass = getpass(f"iCloud app password for {account}: ")
+
+    m = imaplib.IMAP4_SSL(ICLOUD_HOST, ICLOUD_PORT)
+    m.login(account, icloud_pass)
+    m.select("INBOX", readonly=False)
+
+    archive_box = None
+    mailboxes = []
+    if mailbox_arg:
+        archive_box = mailbox_arg
+    else:
+        archive_box, mailboxes = _find_archive_mailbox(m)
+    if not archive_box:
+        m.logout()
+        mailbox_names = ", ".join([name for _, name in mailboxes]) if mailboxes else ""
+        raise SystemExit(
+            "Could not find an Archive mailbox. Pass --mailbox with the target folder name."
+            + (f" Available: {mailbox_names}" if mailbox_names else "")
+        )
+
+    failures = []
+    for uid in uids:
+        typ, _ = m.uid("COPY", uid, archive_box)
+        if typ != "OK":
+            failures.append(uid)
+            continue
+        m.uid("STORE", uid, "+FLAGS.SILENT", "(\\Deleted)")
+
+    m.expunge()
+    m.logout()
+
+    if failures:
+        raise SystemExit(f"Failed to archive UIDs: {', '.join(failures)}")
+
+    for uid in uids:
+        print(f"Archived UID {uid} for {account} -> {archive_box}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Archive inbox items by index")
+    parser.add_argument(
+        "--index",
+        action="append",
+        required=True,
+        help="Index from inbox list (repeatable or comma-separated)",
+    )
+    parser.add_argument("--inbox", default="/tmp/inbox.json", help="Path to inbox JSON")
+    parser.add_argument(
+        "--mailbox",
+        help="iCloud archive mailbox name (if auto-detect fails)",
+    )
+    args = parser.parse_args()
+
+    items = _load_inbox(args.inbox)
+    indices = _parse_indices(args.index)
+    selected = [_find_item(items, idx) for idx in indices]
+
+    gmail_items = [i for i in selected if i.get("source") == "gmail"]
+    icloud_items = [i for i in selected if i.get("source") == "icloud"]
+    unknown = [i for i in selected if i.get("source") not in ("gmail", "icloud")]
+    if unknown:
+        raise SystemExit("Unsupported email source for one or more items")
+
+    for item in gmail_items:
+        _archive_gmail(item)
+
+    if icloud_items:
+        by_account = {}
+        for item in icloud_items:
+            account = item.get("account")
+            uid = item.get("id")
+            if not account or not uid:
+                raise SystemExit("Missing account or uid in inbox item")
+            by_account.setdefault(account, []).append(uid)
+
+        for account, uids in by_account.items():
+            _archive_icloud(account, uids, args.mailbox)
+
+
+if __name__ == "__main__":
+    main()

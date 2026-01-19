@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+import argparse
+import json
+from pathlib import Path
+
+from whatsapp_common import api_call, get_base_url, get_instance, get_state_path, get_token, load_state, save_state
+
+
+def _load_inbox(path: str) -> list:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        raise SystemExit("Inbox JSON not found. Run whatsapp-inbox first.")
+    except json.JSONDecodeError:
+        raise SystemExit("Inbox JSON is invalid. Re-run whatsapp-inbox.")
+
+
+def _find_by_index(items: list, index: int) -> dict:
+    for item in items:
+        if isinstance(item, dict) and item.get("index") == index:
+            return item
+    raise SystemExit(f"Index {index} not found in inbox JSON.")
+
+
+def _normalize_target(target: str) -> str:
+    if not target:
+        return ""
+    if target.endswith("@s.whatsapp.net"):
+        return target.split("@", 1)[0]
+    return target
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Reply to a WhatsApp chat via Evolution API")
+    parser.add_argument("--index", type=int, default=0)
+    parser.add_argument("--text", required=True)
+    parser.add_argument("--number", default="")
+    parser.add_argument("--jid", default="")
+    parser.add_argument("--json", default="/tmp/whatsapp-inbox.json")
+    parser.add_argument("--instance", default="")
+    parser.add_argument("--url", default="")
+    parser.add_argument("--delay", type=int, default=0)
+    parser.add_argument("--link-preview", action="store_true")
+    parser.add_argument("--state", default="")
+    args = parser.parse_args()
+
+    token = get_token()
+    base_url = args.url.strip() or get_base_url()
+    instance = args.instance.strip() or get_instance()
+
+    target = args.number.strip() or args.jid.strip()
+    state_path = args.state.strip() or get_state_path()
+    state = load_state(state_path)
+    entry = None
+    if not target and args.index:
+        items = _load_inbox(args.json)
+        entry = _find_by_index(items, args.index)
+        target = entry.get("number") or entry.get("remote_jid") or ""
+
+    target = _normalize_target(target)
+    if not target:
+        raise SystemExit("Missing target. Provide --number/--jid or use --index with inbox JSON.")
+
+    payload = {
+        "number": target,
+        "text": args.text,
+    }
+    if args.delay:
+        payload["delay"] = args.delay
+    if args.link_preview:
+        payload["linkPreview"] = True
+
+    response = api_call("POST", base_url, f"/message/sendText/{instance}", token, payload=payload)
+
+    message_id = None
+    status = None
+    if isinstance(response, dict):
+        message_id = response.get("key", {}).get("id")
+        status = response.get("status")
+
+    if message_id or status:
+        print(f"Sent: {message_id or ''} {status or ''}".strip())
+    else:
+        print("Sent")
+
+    if entry and entry.get("remote_jid") and entry.get("last_message_id"):
+        state[entry["remote_jid"]] = entry["last_message_id"]
+        save_state(state_path, state)
+
+
+if __name__ == "__main__":
+    main()

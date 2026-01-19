@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+import argparse
+import datetime
+import json
+from pathlib import Path
+
+from slack_common import api_call, get_token, resolve_user_name
+
+
+def _load_inbox(path):
+    inbox_path = Path(path)
+    if not inbox_path.exists():
+        raise SystemExit(f"Inbox JSON not found: {inbox_path}")
+    with inbox_path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _find_item(items, index):
+    for item in items:
+        if item.get("index") == index:
+            return item
+    raise SystemExit(f"No item with index {index} in inbox JSON")
+
+
+def _ts_to_dt(ts: str) -> str:
+    try:
+        return datetime.datetime.fromtimestamp(float(ts)).isoformat(sep=" ", timespec="seconds")
+    except Exception:
+        return ""
+
+
+def _fetch_message(token, channel_id, ts):
+    payload = api_call(
+        "conversations.history",
+        token,
+        {"channel": channel_id, "latest": ts, "inclusive": "true", "limit": 1},
+    )
+    messages = payload.get("messages", [])
+    if not messages:
+        raise SystemExit("Message not found")
+    return messages[0]
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Open a Slack message by inbox index")
+    parser.add_argument("--index", type=int, required=True, help="Index from slack-inbox list")
+    parser.add_argument("--inbox", default="/tmp/slack-inbox.json", help="Path to inbox JSON")
+    parser.add_argument("--json-out", default="/tmp/slack-open.json")
+    args = parser.parse_args()
+
+    token = get_token()
+    items = _load_inbox(args.inbox)
+    item = _find_item(items, args.index)
+
+    channel_id = item.get("id")
+    ts = item.get("latest_ts")
+    if not channel_id or not ts:
+        raise SystemExit("Missing channel id or message ts")
+
+    msg = _fetch_message(token, channel_id, ts)
+    user_cache = {}
+    user_id = msg.get("user")
+    user_name = resolve_user_name(token, user_id, user_cache) if user_id else (msg.get("username") or "")
+
+    print(f"Channel: {item.get('name')}")
+    print(f"From: {user_name or user_id or 'Unknown'}")
+    print(f"Date: {_ts_to_dt(msg.get('ts', '0'))}")
+    print(f"Text: {msg.get('text','').strip()}")
+
+    out = {
+        "index": item.get("index"),
+        "channel_id": channel_id,
+        "channel_name": item.get("name"),
+        "message_ts": msg.get("ts"),
+        "thread_ts": msg.get("thread_ts") or msg.get("ts"),
+        "user_id": user_id,
+        "user_name": user_name,
+        "text": msg.get("text", "").strip(),
+        "date": _ts_to_dt(msg.get("ts", "0")),
+    }
+    Path(args.json_out).parent.mkdir(parents=True, exist_ok=True)
+    with open(args.json_out, "w", encoding="utf-8") as f:
+        json.dump(out, f, ensure_ascii=False, indent=2)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+import argparse
+import datetime
+import json
+from pathlib import Path
+
+from whatsapp_common import (
+    api_call,
+    extract_text_from_message,
+    get_base_url,
+    get_instance,
+    get_state_path,
+    get_token,
+    load_state,
+    normalize_number_from_jid,
+    pick_first,
+    save_state,
+)
+
+
+def _coerce_list(payload):
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("chats", "data", "result", "items"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+    return []
+
+
+def _is_unread_status(status) -> bool:
+    if not status:
+        return True
+    try:
+        return str(status).upper() != "READ"
+    except Exception:
+        return True
+
+
+def _extract_last_from_message(record: dict):
+    if not isinstance(record, dict):
+        return {}
+    message = record.get("message") or {}
+    text = extract_text_from_message(message)
+    if not text:
+        text = pick_first(record, ["text", "body", "caption"]) or ""
+
+    key = record.get("key") or {}
+    from_me = key.get("fromMe")
+    remote_jid = key.get("remoteJid")
+    message_id = key.get("id") or record.get("id")
+    timestamp = record.get("messageTimestamp")
+    sender = record.get("pushName")
+
+    status = None
+    updates = record.get("MessageUpdate") or []
+    if isinstance(updates, list) and updates:
+        status = updates[-1].get("status")
+    if status is None:
+        status = record.get("status")
+
+    return {
+        "text": str(text or ""),
+        "id": message_id,
+        "from_me": from_me,
+        "remote_jid": remote_jid,
+        "timestamp": timestamp,
+        "sender": sender,
+        "status": status,
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description="List unread WhatsApp chats (Evolution API)")
+    parser.add_argument("--instance", default="")
+    parser.add_argument("--url", default="")
+    parser.add_argument("--max", type=int, default=200)
+    parser.add_argument("--json-out", default="/tmp/whatsapp-inbox.json")
+    parser.add_argument("--state", default="")
+    parser.add_argument("--no-update-state", action="store_true")
+    parser.add_argument("--since-days", type=int, default=7)
+    parser.add_argument(
+        "--pending-reply",
+        action="store_true",
+        help="List chats from last N days where the last message is not from me",
+    )
+    args = parser.parse_args()
+
+    token = get_token()
+    base_url = args.url.strip() or get_base_url()
+    instance = args.instance.strip() or get_instance()
+    state_path = args.state.strip() or get_state_path()
+    state = load_state(state_path)
+
+    payload = api_call("POST", base_url, f"/chat/findChats/{instance}", token, payload={})
+    chats = _coerce_list(payload)
+
+    items = []
+    counter = 1
+
+    for chat in chats:
+        if not isinstance(chat, dict):
+            continue
+
+        remote_jid = pick_first(chat, ["remoteJid", "jid", "id", "chatId"]) or ""
+        if isinstance(remote_jid, dict):
+            remote_jid = pick_first(remote_jid, ["remoteJid", "id"]) or ""
+        if not remote_jid:
+            continue
+
+        last_message = pick_first(chat, ["lastMessage", "last_message", "last_message_data"])
+        last_info = _extract_last_from_message(last_message)
+        if not last_info:
+            continue
+
+        if last_info.get("from_me") is not False:
+            continue
+
+        if not args.pending_reply and not _is_unread_status(last_info.get("status")):
+            continue
+
+        last_message_id = last_info.get("id")
+        if not args.pending_reply:
+            if last_message_id and state.get(remote_jid) == last_message_id:
+                continue
+
+        timestamp = last_info.get("timestamp")
+        if args.since_days and timestamp:
+            try:
+                cutoff = int(datetime.datetime.now().timestamp() - (args.since_days * 86400))
+                if int(timestamp) < cutoff:
+                    continue
+            except Exception:
+                pass
+
+        unread_count = pick_first(chat, ["unreadCount", "unread_count"]) or 1
+
+        name = pick_first(chat, ["name", "subject", "pushName", "formattedName", "shortName"]) or last_info.get(
+            "sender"
+        ) or remote_jid
+
+        preview = (last_info.get("text") or "").replace("\n", " ").strip()
+        if len(preview) > 120:
+            preview = preview[:117] + "..."
+        if not preview:
+            preview = "(sin texto)"
+
+        author = (last_info.get("sender") or "").strip()
+        line = f"{counter}) {name} ({unread_count})"
+        if author:
+            line += f" - {author}: {preview}"
+        else:
+            line += f" - {preview}"
+        print(line)
+
+        items.append(
+            {
+                "index": counter,
+                "name": name,
+                "remote_jid": remote_jid,
+                "number": normalize_number_from_jid(remote_jid),
+                "unread_count": unread_count,
+                "last_message_id": last_message_id,
+                "last_message_from_me": last_info.get("from_me"),
+                "last_message_text": last_info.get("text"),
+                "last_message_timestamp": last_info.get("timestamp"),
+                "last_message_sender": last_info.get("sender"),
+                "last_message_status": last_info.get("status"),
+            }
+        )
+
+        if not args.pending_reply and last_message_id and not args.no_update_state:
+            state[remote_jid] = last_message_id
+
+        counter += 1
+        if counter > args.max:
+            break
+
+    Path(args.json_out).parent.mkdir(parents=True, exist_ok=True)
+    with open(args.json_out, "w", encoding="utf-8") as f:
+        json.dump(items, f, ensure_ascii=False, indent=2)
+
+    if not args.pending_reply and not args.no_update_state:
+        save_state(state_path, state)
+
+
+if __name__ == "__main__":
+    main()

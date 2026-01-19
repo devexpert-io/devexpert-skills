@@ -1,37 +1,42 @@
-# Worktree Helper
+# Agent Kit
 
-This repository serves two purposes:
-
-1) Human documentation about Git worktrees
-2) An AI skill (`worktree-helper/`) that guides agents through a consistent worktree workflow
+A curated catalog of Agent Skills plus supporting docs, scripts, and assets.
 
 ## Repository layout
 
-- `docs/` — human documentation
-- `worktree-helper/` — the AI skill (SKILL.md + references + scripts)
+- `skills/` — all skills (SKILL.md + resources)
+- `skills/3rd-party/` — vendored third‑party skills
+- `skills/skill-creator/` — canonical guide + tooling for creating skills
+- `docs/` — legacy worktree documentation (kept for reference)
+- `dist/` — packaged `.skill` artifacts (when generated)
+- `AGENTS.md` — local agent operating rules for this repo
 
-## Skill overview
+## Create or update a skill
 
-The skill helps an agent:
+Start with the skill‑creator:
 
-- Migrate a repo into a `main/` + `worktrees/` layout
-- Create worktrees for tasks or issues
-- Implement work and then merge or create PR/MR
-- Clean up worktrees safely
+```
+./skills/skill-creator/scripts/init_skill.py <skill-name> --path skills
+```
 
-## Documentation
+Validate:
 
-Start here:
+```
+./skills/skill-creator/scripts/quick_validate.py ./skills/<skill-name>
+```
 
-- `docs/what-is-a-worktree.md`
-- `docs/worktree-workflow.md`
-- `docs/troubleshooting.md`
+Package (optional):
 
-## Tooling
+```
+./skills/skill-creator/scripts/package_skill.py ./skills/<skill-name> ./dist
+```
 
-Issue-based flows are easier with:
+## Conventions
 
-- GitHub CLI: `gh`
-- GitLab CLI: `glab`
+- Skills live at `skills/<name>/SKILL.md` and may include `scripts/`, `references/`, `assets/`.
+- `skills/private/` is ignored by git.
+- Secrets (OAuth client_secret.json, API keys, etc.) should live under `~/.config/skills/`.
 
-The skill will fall back to manual issue details if those tools (or MCP integrations) are not available.
+## Worktree helper skill
+
+The worktree helper skill is now located at `skills/worktree-helper/`.

@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+import argparse
+import email
+import html
+import imaplib
+import json
+import os
+import re
+import subprocess
+from email.header import decode_header
+from email import policy
+from email.parser import BytesParser
+from email.utils import parseaddr
+from getpass import getpass
+from pathlib import Path
+
+ICLOUD_HOST = "imap.mail.me.com"
+ICLOUD_PORT = 993
+
+def _run(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+def _decode_header_value(value: str) -> str:
+    if not value:
+        return ""
+    parts = decode_header(value)
+    out = []
+    for part, enc in parts:
+        if isinstance(part, bytes):
+            out.append(part.decode(enc or "utf-8", errors="replace"))
+        else:
+            out.append(part)
+    return "".join(out)
+
+def _display_from(raw: str) -> str:
+    decoded = _decode_header_value(raw)
+    name, addr = parseaddr(decoded)
+    return name or addr or decoded
+
+def _html_to_text(value: str) -> str:
+    if not value:
+        return ""
+    value = re.sub(r"(?is)<(script|style).*?>.*?</\\1>", "", value)
+    value = re.sub(r"(?s)<[^>]+>", " ", value)
+    value = html.unescape(value)
+    value = re.sub(r"[ \\t]+", " ", value)
+    value = re.sub(r"\\n\\s*\\n+", "\\n\\n", value)
+    return value.strip()
+
+def _decode_part(part) -> str:
+    try:
+        content = part.get_content()
+    except Exception:
+        content = None
+    if content is None:
+        try:
+            content = part.get_payload(decode=True)
+        except Exception:
+            content = None
+    if content is None:
+        return ""
+    if isinstance(content, bytes):
+        charset = part.get_content_charset() or part.get_charset() or "utf-8"
+        try:
+            return content.decode(charset, errors="replace")
+        except Exception:
+            return content.decode("utf-8", errors="replace")
+    return str(content)
+
+
+def _extract_body(msg) -> str:
+    if hasattr(msg, "get_body"):
+        part = msg.get_body(preferencelist=("plain", "html"))
+        if part is not None:
+            content = _decode_part(part).strip()
+            if not content:
+                return ""
+            if part.get_content_type() == "text/html":
+                return _html_to_text(content)
+            return content
+
+    parts = []
+    candidates = msg.walk() if msg.is_multipart() else [msg]
+    for part in candidates:
+        if part.get_content_maintype() == "multipart":
+            continue
+        ctype = part.get_content_type()
+        if ctype not in ("text/plain", "text/html"):
+            continue
+        content = _decode_part(part).strip()
+        if not content:
+            continue
+        disposition = part.get_content_disposition() or ""
+        filename = part.get_filename()
+        priority = 2 if ctype == "text/plain" else 1
+        if disposition == "attachment" or filename:
+            priority -= 2
+        parts.append((priority, ctype, content))
+
+    if not parts:
+        return ""
+    _, ctype, content = max(parts, key=lambda item: item[0])
+    if ctype == "text/html":
+        return _html_to_text(content)
+    return content
+
+def _load_inbox(path):
+    inbox_path = Path(path)
+    if not inbox_path.exists():
+        raise SystemExit(f"Inbox JSON not found: {inbox_path}")
+    with inbox_path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+def _find_item(items, index):
+    for item in items:
+        if item.get("index") == index:
+            return item
+    raise SystemExit(f"No item with index {index} in inbox JSON")
+
+def _latest_message_id(messages):
+    if not messages:
+        raise SystemExit("Thread has no messages")
+    def _key(m):
+        try:
+            return int(m.get("internalDate", 0))
+        except Exception:
+            return 0
+    latest = max(messages, key=_key)
+    return latest.get("id")
+
+def _get_headers(payload):
+    headers = payload.get("headers", {})
+    if isinstance(headers, dict):
+        return headers
+    # Fallback: list of {name,value}
+    out = {}
+    for h in headers or []:
+        name = str(h.get("name", "")).lower()
+        if name:
+            out[name] = h.get("value", "")
+    return out
+
+def main():
+    parser = argparse.ArgumentParser(description="Open a Gmail email by inbox index")
+    parser.add_argument("--index", type=int, required=True, help="Index from inbox list")
+    parser.add_argument("--inbox", default="/tmp/inbox.json", help="Path to inbox JSON")
+    parser.add_argument(
+        "--json-out",
+        default="/tmp/email-open.json",
+        help="Write machine-readable details to this path",
+    )
+    args = parser.parse_args()
+
+    items = _load_inbox(args.inbox)
+    item = _find_item(items, args.index)
+
+    if item.get("source") == "gmail":
+        account = item.get("account")
+        thread_id = item.get("id")
+        if not account or not thread_id:
+            raise SystemExit("Missing account or thread id in inbox item")
+
+        thread_cmd = [
+            "gog",
+            "gmail",
+            "thread",
+            "get",
+            "--account",
+            account,
+            "--json",
+            thread_id,
+        ]
+        thread_res = _run(thread_cmd)
+        if thread_res.returncode != 0:
+            raise SystemExit(thread_res.stderr.strip() or thread_res.stdout.strip())
+
+        thread_data = json.loads(thread_res.stdout)
+        messages = thread_data.get("thread", {}).get("messages", [])
+        message_id = _latest_message_id(messages)
+        if not message_id:
+            raise SystemExit("Could not determine latest message id")
+
+        msg_cmd = [
+            "gog",
+            "gmail",
+            "get",
+            "--account",
+            account,
+            "--json",
+            message_id,
+        ]
+        msg_res = _run(msg_cmd)
+        if msg_res.returncode != 0:
+            raise SystemExit(msg_res.stderr.strip() or msg_res.stdout.strip())
+
+        msg_data = json.loads(msg_res.stdout)
+        headers = _get_headers(msg_data)
+        body = msg_data.get("body", "").strip()
+
+        print(f"From: {headers.get('from','').strip()}")
+        print(f"To: {headers.get('to','').strip()}")
+        print(f"Date: {headers.get('date','').strip()}")
+        print(f"Subject: {headers.get('subject','').strip()}")
+        print("")
+        print(body)
+
+        if args.json_out:
+            out = {
+                "index": item.get("index"),
+                "source": item.get("source"),
+                "account": account,
+                "thread_id": thread_id,
+                "message_id": message_id,
+                "headers": headers,
+                "body": body,
+            }
+            Path(args.json_out).parent.mkdir(parents=True, exist_ok=True)
+            with open(args.json_out, "w", encoding="utf-8") as f:
+                json.dump(out, f, ensure_ascii=False, indent=2)
+        return
+
+    if item.get("source") == "icloud":
+        account = item.get("account")
+        uid = item.get("id")
+        if not account or not uid:
+            raise SystemExit("Missing account or uid in inbox item")
+
+        icloud_pass = os.environ.get("ICLOUD_APP_PASSWORD")
+        if not icloud_pass:
+            icloud_pass = getpass(f"iCloud app password for {account}: ")
+
+        m = imaplib.IMAP4_SSL(ICLOUD_HOST, ICLOUD_PORT)
+        m.login(account, icloud_pass)
+        m.select("INBOX", readonly=True)
+        typ, msgdata = m.uid("fetch", uid, "(BODY.PEEK[])")
+        if typ != "OK" or not msgdata:
+            m.logout()
+            raise SystemExit("Failed to fetch iCloud message")
+        raw = None
+        for part in msgdata:
+            if isinstance(part, tuple) and part[1]:
+                raw = part[1]
+                break
+            if isinstance(part, (bytes, bytearray)) and part:
+                raw = part
+                break
+        if not raw:
+            m.logout()
+            raise SystemExit("No message bytes returned from iCloud")
+        msg = BytesParser(policy=policy.default).parsebytes(raw)
+        headers = {
+            "from": _display_from(msg.get("From", "")),
+            "to": _decode_header_value(msg.get("To", "")),
+            "date": _decode_header_value(msg.get("Date", "")),
+            "subject": _decode_header_value(msg.get("Subject", "")),
+        }
+        body = _extract_body(msg)
+        m.logout()
+
+        print(f"From: {headers.get('from','').strip()}")
+        print(f"To: {headers.get('to','').strip()}")
+        print(f"Date: {headers.get('date','').strip()}")
+        print(f"Subject: {headers.get('subject','').strip()}")
+        print("")
+        print(body)
+
+        if args.json_out:
+            out = {
+                "index": item.get("index"),
+                "source": item.get("source"),
+                "account": account,
+                "uid": uid,
+                "headers": headers,
+                "body": body,
+            }
+            Path(args.json_out).parent.mkdir(parents=True, exist_ok=True)
+            with open(args.json_out, "w", encoding="utf-8") as f:
+                json.dump(out, f, ensure_ascii=False, indent=2)
+        return
+
+    raise SystemExit("Unsupported email source")
+
+
+if __name__ == "__main__":
+    main()

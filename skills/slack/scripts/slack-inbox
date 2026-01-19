@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+import argparse
+import datetime
+import json
+from pathlib import Path
+
+from slack_common import (
+    api_call,
+    conversation_display_name,
+    get_token,
+    paginate,
+    resolve_user_name,
+)
+
+
+def _ts_to_dt(ts: str) -> str:
+    try:
+        return datetime.datetime.fromtimestamp(float(ts)).isoformat(sep=" ", timespec="seconds")
+    except Exception:
+        return ""
+
+
+def _latest_unread(conv, token, last_read):
+    params = {
+        "channel": conv.get("id"),
+        "limit": 50,
+    }
+    try:
+        if last_read and float(last_read) > 0:
+            params["oldest"] = last_read
+    except Exception:
+        pass
+    try:
+        payload = api_call("conversations.history", token, params)
+    except SystemExit:
+        return None, 0, False
+    messages = payload.get("messages", [])
+    unread = []
+    for msg in messages:
+        if msg.get("subtype") == "message_deleted":
+            continue
+        if "text" not in msg:
+            continue
+        unread.append(msg)
+    if not unread:
+        return None, 0, payload.get("has_more", False)
+    latest = max(unread, key=lambda m: float(m.get("ts", 0)))
+    return latest, len(unread), payload.get("has_more", False)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="List unread Slack conversations")
+    parser.add_argument(
+        "--types",
+        default="public_channel,private_channel,im,mpim",
+        help="Conversation types",
+    )
+    parser.add_argument("--max", type=int, default=1000)
+    parser.add_argument("--json-out", default="/tmp/slack-inbox.json")
+    args = parser.parse_args()
+
+    token = get_token()
+    user_cache = {}
+
+    convs = paginate(
+        "users.conversations",
+        token,
+        {
+            "types": args.types,
+            "exclude_archived": "true",
+            "limit": 200,
+        },
+        "channels",
+    )
+
+    items = []
+    counter = 1
+
+    for conv in convs:
+        unread_hint = conv.get("unread_count") or conv.get("unread_count_display") or 0
+
+        if conv.get("is_im") and (conv.get("last_read") is None or conv.get("latest") is None):
+            try:
+                info = api_call("conversations.info", token, {"channel": conv.get("id")}, timeout=5)
+                conv = {**conv, **info.get("channel", {})}
+            except (SystemExit, KeyboardInterrupt, TimeoutError, Exception):
+                if not unread_hint:
+                    continue
+
+        unread_hint = conv.get("unread_count") or conv.get("unread_count_display") or unread_hint
+        last_read = conv.get("last_read") or ""
+        latest = conv.get("latest") or ""
+        if isinstance(latest, dict):
+            latest = latest.get("ts") or ""
+        if latest and last_read:
+            try:
+                if float(latest) <= float(last_read) and not unread_hint:
+                    continue
+            except Exception:
+                if not unread_hint and not conv.get("is_im"):
+                    continue
+        else:
+            # Missing timestamps: rely on unread hints.
+            if not unread_hint:
+                continue
+
+        latest_msg, unread_count, has_more = _latest_unread(conv, token, last_read)
+        if not latest_msg:
+            continue
+
+        display = conversation_display_name(conv, token, user_cache)
+        latest_text = latest_msg.get("text", "").strip()
+        latest_user = latest_msg.get("user") or latest_msg.get("username") or latest_msg.get("bot_id") or ""
+        latest_user_name = ""
+        if latest_msg.get("user"):
+            latest_user_name = resolve_user_name(token, latest_msg.get("user"), user_cache)
+        elif latest_msg.get("username"):
+            latest_user_name = latest_msg.get("username")
+
+        count_label = str(unread_count) + ("+" if has_more else "")
+        preview = latest_text.replace("\n", " ")
+        if len(preview) > 120:
+            preview = preview[:117] + "..."
+        author = latest_user_name or latest_user
+
+        print(f"{counter}) {display} ({count_label}) - {author}: {preview}")
+
+        items.append(
+            {
+                "index": counter,
+                "id": conv.get("id"),
+                "name": display,
+                "raw_name": conv.get("name"),
+                "type": "im" if conv.get("is_im") else "mpim" if conv.get("is_mpim") else "group" if conv.get("is_group") else "channel",
+                "last_read": last_read,
+                "latest_ts": latest_msg.get("ts"),
+                "latest_text": latest_text,
+                "latest_user_id": latest_msg.get("user"),
+                "latest_user_name": latest_user_name,
+                "unread_count": unread_count,
+                "unread_has_more": has_more,
+                "latest_at": _ts_to_dt(latest_msg.get("ts", "0")),
+            }
+        )
+        counter += 1
+
+        if counter > args.max:
+            break
+
+    Path(args.json_out).parent.mkdir(parents=True, exist_ok=True)
+    with open(args.json_out, "w", encoding="utf-8") as f:
+        json.dump(items, f, ensure_ascii=False, indent=2)
+
+
+if __name__ == "__main__":
+    main()

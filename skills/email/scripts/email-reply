@@ -1,0 +1,483 @@
+#!/usr/bin/env python3
+import argparse
+import email
+from email import policy
+import html
+import imaplib
+import json
+import os
+import re
+import smtplib
+import subprocess
+import time
+from email.header import decode_header
+from email.message import EmailMessage
+from email.parser import BytesParser
+from email.utils import formatdate, getaddresses, make_msgid, parseaddr
+from getpass import getpass
+from pathlib import Path
+
+ICLOUD_IMAP_HOST = "imap.mail.me.com"
+ICLOUD_IMAP_PORT = 993
+ICLOUD_SMTP_HOST = "smtp.mail.me.com"
+ICLOUD_SMTP_PORT = 587
+
+
+def _run(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+
+def _decode_header_value(value: str) -> str:
+    if not value:
+        return ""
+    parts = decode_header(value)
+    out = []
+    for part, enc in parts:
+        if isinstance(part, bytes):
+            out.append(part.decode(enc or "utf-8", errors="replace"))
+        else:
+            out.append(part)
+    return "".join(out)
+
+
+def _reply_subject(subject: str) -> str:
+    subject = (subject or "").strip()
+    if not subject:
+        return "Re:"
+    lowered = subject.lower()
+    if lowered.startswith("re:"):
+        return subject
+    return f"Re: {subject}"
+
+
+def _parse_addr(value: str) -> str:
+    name, addr = parseaddr(value or "")
+    return addr or value or ""
+
+
+def _normalize_addresses(values):
+    addresses = []
+    for name, addr in getaddresses(values or []):
+        addr = (addr or "").strip()
+        if addr:
+            addresses.append(addr)
+    return addresses
+
+
+def _dedupe_addrs(addrs, exclude=None):
+    seen = set()
+    out = []
+    exclude = {e.lower() for e in (exclude or []) if e}
+    for addr in addrs:
+        key = addr.lower()
+        if key in exclude or key in seen:
+            continue
+        seen.add(key)
+        out.append(addr)
+    return out
+
+
+def _parse_list_response(line: bytes):
+    try:
+        decoded = line.decode("utf-8", errors="replace")
+    except Exception:
+        decoded = str(line)
+
+    flags = []
+    if "(" in decoded and ")" in decoded:
+        flags_part = decoded.split("(", 1)[1].split(")", 1)[0]
+        flags = [f for f in flags_part.split() if f]
+
+    quoted = re.findall(r'"((?:\\.|[^"])*)"', decoded)
+    if quoted:
+        name = quoted[-1]
+    else:
+        parts = decoded.split()
+        name = parts[-1] if parts else ""
+        if name.startswith('"') and name.endswith('"'):
+            name = name[1:-1]
+
+    return flags, name
+
+
+def _find_sent_mailbox(m):
+    typ, data = m.list()
+    if typ != "OK":
+        return "Sent Messages"
+
+    mailboxes = []
+    for line in data or []:
+        flags, name = _parse_list_response(line)
+        if name:
+            mailboxes.append((flags, name))
+
+    for flags, name in mailboxes:
+        if "\\Sent" in flags:
+            return name
+
+    candidates = [
+        "Sent Messages",
+        "Sent",
+        "INBOX/Sent",
+        "INBOX.Sent",
+        "Enviados",
+        "INBOX/Enviados",
+        "INBOX.Enviados",
+    ]
+    lower_map = {name.lower(): name for _, name in mailboxes}
+    for cand in candidates:
+        found = lower_map.get(cand.lower())
+        if found:
+            return found
+
+    return "Sent Messages"
+
+
+def _html_to_text(value: str) -> str:
+    if not value:
+        return ""
+    value = re.sub(r"(?is)<(script|style).*?>.*?</\\1>", "", value)
+    value = re.sub(r"(?s)<[^>]+>", " ", value)
+    value = html.unescape(value)
+    value = re.sub(r"[ \t]+", " ", value)
+    value = re.sub(r"\n\s*\n+", "\n\n", value)
+    return value.strip()
+
+
+def _extract_body(msg) -> str:
+    if msg.is_multipart():
+        text_part = None
+        html_part = None
+        for part in msg.walk():
+            if part.get_content_maintype() == "multipart":
+                continue
+            if part.get_content_disposition() == "attachment":
+                continue
+            ctype = part.get_content_type()
+            try:
+                content = part.get_content()
+            except Exception:
+                try:
+                    content = part.get_payload(decode=True)
+                    if isinstance(content, bytes):
+                        content = content.decode(part.get_content_charset() or "utf-8", errors="replace")
+                except Exception:
+                    content = ""
+            if ctype == "text/plain" and content:
+                text_part = content
+                break
+            if ctype == "text/html" and content and not html_part:
+                html_part = content
+        if text_part:
+            return text_part.strip()
+        if html_part:
+            return _html_to_text(html_part)
+        return ""
+    try:
+        content = msg.get_content()
+        if msg.get_content_type() == "text/html":
+            return _html_to_text(content)
+        return content.strip()
+    except Exception:
+        return ""
+
+
+def _load_inbox(path):
+    inbox_path = Path(path)
+    if not inbox_path.exists():
+        raise SystemExit(f"Inbox JSON not found: {inbox_path}")
+    with inbox_path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _find_item(items, index):
+    for item in items:
+        if item.get("index") == index:
+            return item
+    raise SystemExit(f"No item with index {index} in inbox JSON")
+
+
+def _latest_message_id(messages):
+    if not messages:
+        raise SystemExit("Thread has no messages")
+
+    def _key(m):
+        try:
+            return int(m.get("internalDate", 0))
+        except Exception:
+            return 0
+
+    latest = max(messages, key=_key)
+    return latest.get("id")
+
+
+def _get_headers(payload):
+    headers = payload.get("headers", {})
+    if isinstance(headers, dict):
+        return headers
+    out = {}
+    for h in headers or []:
+        name = str(h.get("name", "")).lower()
+        if name:
+            out[name] = h.get("value", "")
+    return out
+
+
+def _load_body(args) -> str:
+    if args.body is not None:
+        return args.body
+    if args.body_file:
+        path = Path(args.body_file)
+        if not path.exists():
+            raise SystemExit(f"Body file not found: {path}")
+        return path.read_text(encoding="utf-8")
+    raise SystemExit("Either --body or --body-file is required")
+
+
+def _send_gmail(item, body, subject_override, reply_all):
+    account = item.get("account")
+    thread_id = item.get("id")
+    if not account or not thread_id:
+        raise SystemExit("Missing account or thread id in inbox item")
+
+    thread_cmd = [
+        "gog",
+        "gmail",
+        "thread",
+        "get",
+        "--account",
+        account,
+        "--json",
+        thread_id,
+    ]
+    thread_res = _run(thread_cmd)
+    if thread_res.returncode != 0:
+        raise SystemExit(thread_res.stderr.strip() or thread_res.stdout.strip())
+
+    thread_data = json.loads(thread_res.stdout)
+    messages = thread_data.get("thread", {}).get("messages", [])
+    message_id = _latest_message_id(messages)
+    if not message_id:
+        raise SystemExit("Could not determine latest message id")
+
+    msg_cmd = [
+        "gog",
+        "gmail",
+        "get",
+        "--account",
+        account,
+        "--json",
+        message_id,
+    ]
+    msg_res = _run(msg_cmd)
+    if msg_res.returncode != 0:
+        raise SystemExit(msg_res.stderr.strip() or msg_res.stdout.strip())
+
+    msg_data = json.loads(msg_res.stdout)
+    headers = _get_headers(msg_data)
+
+    subject = subject_override or _reply_subject(headers.get("subject", ""))
+
+    cmd = [
+        "gog",
+        "gmail",
+        "send",
+        "--account",
+        account,
+        "--reply-to-message-id",
+        message_id,
+        "--subject",
+        subject,
+        "--body",
+        body,
+    ]
+
+    if reply_all:
+        cmd.append("--reply-all")
+    else:
+        reply_to = _parse_addr(headers.get("reply-to", ""))
+        sender = _parse_addr(headers.get("from", ""))
+        to_addr = reply_to or sender
+        if not to_addr:
+            raise SystemExit("Could not determine reply recipient")
+        cmd.extend(["--to", to_addr])
+
+    res = _run(cmd)
+    if res.returncode != 0:
+        raise SystemExit(res.stderr.strip() or res.stdout.strip())
+
+    print(f"Sent reply for {account} (thread {thread_id})")
+
+
+def _fetch_icloud_message(account, uid):
+    icloud_pass = os.environ.get("ICLOUD_APP_PASSWORD")
+    if not icloud_pass:
+        icloud_pass = getpass(f"iCloud app password for {account}: ")
+
+    m = imaplib.IMAP4_SSL(ICLOUD_IMAP_HOST, ICLOUD_IMAP_PORT)
+    m.login(account, icloud_pass)
+    m.select("INBOX", readonly=True)
+    typ, msgdata = m.uid("fetch", uid, "(BODY.PEEK[])")
+    if typ != "OK" or not msgdata:
+        m.logout()
+        raise SystemExit("Failed to fetch iCloud message")
+
+    raw = None
+    for part in msgdata:
+        if isinstance(part, tuple) and part[1]:
+            raw = part[1]
+            break
+        if isinstance(part, (bytes, bytearray)) and part:
+            raw = part
+            break
+
+    if not raw:
+        m.logout()
+        raise SystemExit("No message bytes returned from iCloud")
+
+    msg = BytesParser(policy=policy.default).parsebytes(raw)
+    m.logout()
+    return msg, icloud_pass
+
+
+def _build_icloud_reply_message(msg, account, body, subject_override, reply_all):
+    reply_to = _parse_addr(_decode_header_value(msg.get("Reply-To", "")))
+    sender = _parse_addr(_decode_header_value(msg.get("From", "")))
+    if reply_all:
+        base_to = [reply_to or sender]
+        orig_to = _normalize_addresses([_decode_header_value(msg.get("To", ""))])
+        orig_cc = _normalize_addresses([_decode_header_value(msg.get("Cc", ""))])
+        to_list = _dedupe_addrs(base_to + orig_to, exclude=[account])
+        cc_list = _dedupe_addrs(orig_cc, exclude=[account] + to_list)
+    else:
+        to_addr = reply_to or sender
+        if not to_addr:
+            raise SystemExit("Could not determine reply recipient")
+        to_list = [to_addr]
+        cc_list = []
+
+    subject = subject_override or _reply_subject(_decode_header_value(msg.get("Subject", "")))
+
+    out = EmailMessage()
+    out["From"] = account
+    out["To"] = ", ".join(to_list)
+    if cc_list:
+        out["Cc"] = ", ".join(cc_list)
+    out["Subject"] = subject
+    out["Date"] = formatdate(time.time(), localtime=True)
+    out["Message-ID"] = make_msgid()
+
+    message_id = msg.get("Message-ID")
+    if message_id:
+        out["In-Reply-To"] = message_id
+        refs = msg.get_all("References", [])
+        refs_line = " ".join(refs + [message_id]) if refs else message_id
+        out["References"] = refs_line
+
+    out.set_content(body)
+    return out, to_addr
+
+
+def _append_icloud_sent(account, icloud_pass, message):
+    m = imaplib.IMAP4_SSL(ICLOUD_IMAP_HOST, ICLOUD_IMAP_PORT)
+    m.login(account, icloud_pass)
+    mailbox = _find_sent_mailbox(m)
+    safe_mailbox = mailbox
+    if any(ch.isspace() for ch in mailbox):
+        safe_mailbox = '"' + mailbox.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    msg_bytes = message.as_bytes(policy=policy.SMTP)
+    m.append(safe_mailbox, "\\Seen", imaplib.Time2Internaldate(time.time()), msg_bytes)
+    m.logout()
+
+
+def _send_icloud(item, body, subject_override, reply_all, append_sent, append_only):
+    account = item.get("account")
+    uid = item.get("id")
+    if not account or not uid:
+        raise SystemExit("Missing account or uid in inbox item")
+
+    msg, icloud_pass = _fetch_icloud_message(account, uid)
+
+    out = _build_icloud_reply_message(msg, account, body, subject_override, reply_all)
+
+    if append_only:
+        _append_icloud_sent(account, icloud_pass, out)
+        print(f"Appended reply to Sent for {account} (uid {uid})")
+        return
+
+    smtp = smtplib.SMTP(ICLOUD_SMTP_HOST, ICLOUD_SMTP_PORT)
+    try:
+        smtp.starttls()
+        smtp.login(account, icloud_pass)
+        smtp.send_message(out)
+    finally:
+        smtp.quit()
+
+    if append_sent:
+        _append_icloud_sent(account, icloud_pass, out)
+
+    print(f"Sent reply for {account} (uid {uid})")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Reply to an email by inbox index")
+    parser.add_argument("--index", type=int, required=True, help="Index from inbox list")
+    parser.add_argument("--inbox", default="/tmp/inbox.json", help="Path to inbox JSON")
+    parser.add_argument("--body", help="Reply body (plain text)")
+    parser.add_argument("--body-file", help="Path to file containing reply body")
+    parser.add_argument("--subject", help="Override subject")
+    reply_group = parser.add_mutually_exclusive_group()
+    reply_group.add_argument(
+        "--reply-all",
+        action="store_true",
+        help="Reply-all (default). Uses recipients from original message.",
+    )
+    reply_group.add_argument(
+        "--no-reply-all",
+        action="store_true",
+        help="Reply only to sender (no CC).",
+    )
+    parser.add_argument(
+        "--append-only",
+        action="store_true",
+        help="Append to Sent without sending (iCloud only).",
+    )
+    parser.add_argument(
+        "--no-append-sent",
+        action="store_true",
+        help="Do not append a copy to Sent (iCloud only).",
+    )
+    args = parser.parse_args()
+
+    body = _load_body(args)
+
+    items = _load_inbox(args.inbox)
+    item = _find_item(items, args.index)
+
+    reply_all = True
+    if args.no_reply_all:
+        reply_all = False
+
+    source = item.get("source")
+    if source == "gmail":
+        if args.append_only:
+            raise SystemExit("--append-only is not supported for Gmail")
+        _send_gmail(item, body, args.subject, reply_all)
+        return
+    if source == "icloud":
+        _send_icloud(
+            item,
+            body,
+            args.subject,
+            reply_all,
+            append_sent=not args.no_append_sent,
+            append_only=args.append_only,
+        )
+        return
+
+    raise SystemExit("Unsupported email source")
+
+
+if __name__ == "__main__":
+    main()

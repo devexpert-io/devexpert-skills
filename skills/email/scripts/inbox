@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import email
+import imaplib
+import os
+import subprocess
+from email.header import decode_header
+from email.utils import parseaddr
+from getpass import getpass
+
+ICLOUD_HOST = "imap.mail.me.com"
+ICLOUD_PORT = 993
+SKILLS_CONFIG_PATH = os.path.expanduser("~/.config/skills/config.json")
+
+
+def decode_header_value(value: str) -> str:
+    if not value:
+        return ""
+    parts = decode_header(value)
+    out = []
+    for part, enc in parts:
+        if isinstance(part, bytes):
+            out.append(part.decode(enc or "utf-8", errors="replace"))
+        else:
+            out.append(part)
+    return "".join(out)
+
+
+def display_from(raw: str) -> str:
+    decoded = decode_header_value(raw)
+    name, addr = parseaddr(decoded)
+    return name or addr or decoded
+
+
+def run_gog(account: str, max_results: int):
+    cmd = [
+        "gog",
+        "gmail",
+        "search",
+        f"--account={account}",
+        "--plain",
+        f"--max={max_results}",
+        "in:inbox",
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "gog error")
+    lines = [line for line in proc.stdout.splitlines() if line.strip()]
+    if len(lines) <= 1:
+        return []
+    items = []
+    for line in lines[1:]:
+        parts = line.split("\t")
+        if len(parts) < 4:
+            continue
+        msg_id = parts[0].strip()
+        raw_from = parts[2].strip()
+        subject = decode_header_value(parts[3].strip())
+        items.append(
+            {
+                "source": "gmail",
+                "account": account,
+                "id": msg_id,
+                "from": display_from(raw_from),
+                "subject": subject,
+            }
+        )
+    return items
+
+
+def run_icloud(user: str, password: str, max_results: int):
+    m = imaplib.IMAP4_SSL(ICLOUD_HOST, ICLOUD_PORT)
+    m.login(user, password)
+    m.select("INBOX", readonly=True)
+    typ, data = m.uid("search", None, "ALL")
+    if typ != "OK":
+        m.logout()
+        return []
+    if not data or not data[0]:
+        m.logout()
+        return []
+    uids = data[0].split()
+    if not uids:
+        m.logout()
+        return []
+    latest = uids[-max_results:]
+    items = []
+    for uid in reversed(latest):
+        typ, msgdata = m.uid("fetch", uid, "(RFC822.HEADER)")
+        if typ != "OK":
+            continue
+        msg = email.message_from_bytes(msgdata[0][1])
+        raw_from = msg.get("From", "")
+        subject = decode_header_value(msg.get("Subject", ""))
+        items.append(
+            {
+                "source": "icloud",
+                "account": user,
+                "id": uid.decode("utf-8", errors="replace"),
+                "from": display_from(raw_from),
+                "subject": subject,
+            }
+        )
+    m.logout()
+    return items
+
+
+def load_skills_config() -> dict:
+    try:
+        with open(SKILLS_CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def get_email_config() -> tuple[list[str], str | None]:
+    cfg = load_skills_config().get("email", {})
+    gmail_accounts = cfg.get("gmail_accounts", [])
+    if isinstance(gmail_accounts, str):
+        gmail_accounts = [gmail_accounts]
+    elif not isinstance(gmail_accounts, list):
+        gmail_accounts = []
+    gmail_accounts = [acc for acc in gmail_accounts if isinstance(acc, str) and acc.strip()]
+    icloud_user = cfg.get("icloud_user")
+    if icloud_user and not isinstance(icloud_user, str):
+        icloud_user = None
+    return gmail_accounts, icloud_user
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Show inbox items for configured accounts")
+    parser.add_argument("--max-gmail", type=int, default=20)
+    parser.add_argument("--max-icloud", type=int, default=20)
+    parser.add_argument("--icloud-user")
+    parser.add_argument("--json-out", help="Write machine-readable results to this path")
+    args = parser.parse_args()
+
+    gmail_accounts, icloud_default = get_email_config()
+    icloud_user = args.icloud_user or icloud_default
+
+    if not gmail_accounts and not icloud_user:
+        raise SystemExit(
+            "Missing email configuration. Set email.gmail_accounts and/or email.icloud_user in "
+            "~/.config/skills/config.json or pass --icloud-user."
+        )
+
+    icloud_pass = None
+    if icloud_user:
+        icloud_pass = os.environ.get("ICLOUD_APP_PASSWORD")
+        if not icloud_pass:
+            icloud_pass = getpass(f"iCloud app password for {icloud_user}: ")
+
+    counter = 1
+    all_items = []
+
+    for i, account in enumerate(gmail_accounts):
+        if i > 0:
+            print("")
+        print(account)
+        items = run_gog(account, args.max_gmail)
+        if not items:
+            print("- sin resultados")
+            continue
+        for item in items:
+            print(f"{counter}) {item['from']} - \"{item['subject']}\"")
+            all_items.append({"index": counter, **item})
+            counter += 1
+
+    if icloud_user:
+        print("")
+        print(icloud_user)
+        icloud_items = run_icloud(icloud_user, icloud_pass, args.max_icloud)
+        if not icloud_items:
+            print("- sin resultados")
+        else:
+            for item in icloud_items:
+                print(f"{counter}) {item['from']} - \"{item['subject']}\"")
+                all_items.append({"index": counter, **item})
+                counter += 1
+
+    if args.json_out:
+        with open(args.json_out, "w", encoding="utf-8") as f:
+            json.dump(all_items, f, ensure_ascii=False, indent=2)
+
+
+if __name__ == "__main__":
+    main()

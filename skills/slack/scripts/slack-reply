@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+import argparse
+import json
+from pathlib import Path
+
+from slack_common import api_call, get_token
+
+
+def _load_inbox(path):
+    inbox_path = Path(path)
+    if not inbox_path.exists():
+        raise SystemExit(f"Inbox JSON not found: {inbox_path}")
+    with inbox_path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _find_item(items, index):
+    for item in items:
+        if item.get("index") == index:
+            return item
+    raise SystemExit(f"No item with index {index} in inbox JSON")
+
+
+def _fetch_message(token, channel_id, ts):
+    payload = api_call(
+        "conversations.history",
+        token,
+        {"channel": channel_id, "latest": ts, "inclusive": "true", "limit": 1},
+    )
+    messages = payload.get("messages", [])
+    if not messages:
+        raise SystemExit("Message not found")
+    return messages[0]
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Reply to a Slack message by inbox index")
+    parser.add_argument("--index", type=int, required=True, help="Index from slack-inbox list")
+    parser.add_argument("--text", required=True, help="Reply text")
+    parser.add_argument("--inbox", default="/tmp/slack-inbox.json", help="Path to inbox JSON")
+    parser.add_argument("--no-thread", action="store_true", help="Do not reply in thread")
+    parser.add_argument("--json-out", default="/tmp/slack-reply.json")
+    args = parser.parse_args()
+
+    token = get_token()
+    items = _load_inbox(args.inbox)
+    item = _find_item(items, args.index)
+
+    channel_id = item.get("id")
+    ts = item.get("latest_ts")
+    if not channel_id or not ts:
+        raise SystemExit("Missing channel id or message ts")
+
+    msg = _fetch_message(token, channel_id, ts)
+    is_dm = item.get("type") in {"im", "mpim"}
+    thread_ts = None if (args.no_thread or is_dm) else (msg.get("thread_ts") or msg.get("ts"))
+
+    payload = {
+        "channel": channel_id,
+        "text": args.text,
+    }
+    if thread_ts:
+        payload["thread_ts"] = thread_ts
+
+    res = api_call("chat.postMessage", token, payload)
+    try:
+        mark_ts = max(float(ts), float(res.get("ts") or 0))
+    except Exception:
+        mark_ts = res.get("ts") or ts
+    api_call("conversations.mark", token, {"channel": channel_id, "ts": str(mark_ts)})
+
+    out = {
+        "index": item.get("index"),
+        "channel_id": channel_id,
+        "message_ts": res.get("ts"),
+        "thread_ts": thread_ts,
+        "text": args.text,
+        "marked_read_ts": str(mark_ts),
+    }
+    Path(args.json_out).parent.mkdir(parents=True, exist_ok=True)
+    with open(args.json_out, "w", encoding="utf-8") as f:
+        json.dump(out, f, ensure_ascii=False, indent=2)
+
+    print(f"Sent reply to {item.get('name')}")
+
+
+if __name__ == "__main__":
+    main()

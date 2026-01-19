@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+import json
+import os
+import subprocess
+from collections import OrderedDict
+
+RULES_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "rules.json")
+INBOX_JSON = "/tmp/inbox.json"
+INBOX_CANDIDATES = [
+    os.path.join(os.path.dirname(__file__), "inbox"),
+    os.path.expanduser("~/.config/aipal/scripts/inbox"),
+    os.path.expanduser("~/.config/aibot/scripts/inbox"),
+]
+
+EMOJI_BY_ACTION = {
+    "open": "🔍",
+    "archive": "🗂️",
+    "review": "👀",
+    "wait": "⏳",
+}
+
+
+def _load_rules():
+    try:
+        with open(RULES_PATH, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except FileNotFoundError:
+        return [], "review"
+    rules = payload.get("rules", [])
+    default_action = payload.get("default_action", "review")
+    return rules, default_action
+
+
+def _match_rule(item, rule):
+    sender = (item.get("from") or "").lower()
+    subject = (item.get("subject") or "").lower()
+
+    from_contains = (rule.get("from_contains") or "").lower()
+    from_contains_any = [s.lower() for s in (rule.get("from_contains_any") or [])]
+    if from_contains and from_contains not in sender:
+        return False
+    if from_contains_any and not any(s in sender for s in from_contains_any):
+        return False
+
+    subject_contains = (rule.get("subject_contains") or "").lower()
+    subject_contains_any = [s.lower() for s in (rule.get("subject_contains_any") or [])]
+    if subject_contains and subject_contains not in subject:
+        return False
+    if subject_contains_any and not any(s in subject for s in subject_contains_any):
+        return False
+
+    subject_not_contains = (rule.get("subject_not_contains") or "").lower()
+    if subject_not_contains and subject_not_contains in subject:
+        return False
+
+    return True
+
+
+def _triage_action(item, rules, default_action):
+    for rule in rules:
+        if _match_rule(item, rule):
+            return rule.get("action") or default_action
+    return default_action
+
+
+def _group_by_account(items):
+    grouped = OrderedDict()
+    for item in items:
+        account = item.get("account") or "(sin cuenta)"
+        grouped.setdefault(account, [])
+        grouped[account].append(item)
+    return grouped
+
+
+def _resolve_inbox_script():
+    for path in INBOX_CANDIDATES:
+        if os.path.exists(path):
+            return path
+    tried = ", ".join(INBOX_CANDIDATES)
+    raise FileNotFoundError(f"Inbox script not found. Tried: {tried}")
+
+
+def main():
+    inbox_script = _resolve_inbox_script()
+    subprocess.run(
+        [inbox_script, "--json-out", INBOX_JSON],
+        check=True,
+        stdout=subprocess.DEVNULL,
+    )
+
+    try:
+        with open(INBOX_JSON, "r", encoding="utf-8") as f:
+            items = json.load(f)
+    except FileNotFoundError:
+        items = []
+
+    rules, default_action = _load_rules()
+    grouped = _group_by_account(items)
+
+    for account, account_items in grouped.items():
+        print(f"📧 **{account}**")
+        print("—")
+        if not account_items:
+            print("- sin resultados")
+            print()
+            continue
+        for item in account_items:
+            action = _triage_action(item, rules, default_action)
+            emoji = EMOJI_BY_ACTION.get(action, EMOJI_BY_ACTION["review"])
+            index = item.get("index", "?")
+            sender = item.get("from") or ""
+            subject = item.get("subject") or ""
+            print(f"{emoji} {index}) {sender} - \"{subject}\"")
+        print()
+
+
+if __name__ == "__main__":
+    main()

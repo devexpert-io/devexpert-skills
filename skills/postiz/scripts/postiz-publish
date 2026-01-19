@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""Generic Postiz publish helper.
+
+This helper is intentionally generic:
+- It does NOT know anything about specific accounts/channels.
+- It does NOT translate.
+- It only helps with the multi-step "upload local images -> use public URLs" flow.
+
+Usage:
+  postiz-publish --content "text" --integrations <id> --integrations <id> [--status now|draft|scheduled] [--scheduled-date ISO] [--images /path/a.jpg /path/b.png]
+
+Auth:
+- Uses POSTIZ_API_KEY/POSTIZ_BASE_URL env.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import shutil
+from pathlib import Path
+
+def _load_postiz_env():
+    api_key = os.getenv("POSTIZ_API_KEY", "").strip()
+    base_url = os.getenv("POSTIZ_BASE_URL", "").strip()
+    return {"POSTIZ_API_KEY": api_key, "POSTIZ_BASE_URL": base_url}
+
+
+def _cli_cmd(base_args):
+    cli = "postiz"
+    if not shutil.which(cli):
+        raise SystemExit(
+            "Postiz CLI not found. Install it and ensure `postiz` is in PATH before running this helper."
+        )
+    return [cli] + base_args
+
+
+def _run(cmd, env):
+    return subprocess.run(cmd, env=env, capture_output=True, text=True)
+
+
+def upload_images(local_paths, env):
+    public_urls = []
+    for p in local_paths or []:
+        file_path = Path(p).expanduser().resolve()
+        if not file_path.exists():
+            raise SystemExit(f"Image not found: {file_path}")
+
+        cmd = _cli_cmd(["upload-file", "--file-path", str(file_path), "--pretty"])
+        res = _run(cmd, env)
+        if res.returncode != 0:
+            raise SystemExit(res.stderr.strip() or "postiz upload-file failed")
+
+        try:
+            payload = json.loads(res.stdout)
+            url = payload.get("file", {}).get("path")
+        except Exception:
+            url = None
+
+        if not url:
+            raise SystemExit("Could not parse uploaded file public URL from Postiz output")
+        public_urls.append(url)
+
+    return public_urls
+
+
+def publish(content, integration_ids, status, scheduled_date, image_paths):
+    env = os.environ.copy()
+    env.update(_load_postiz_env())
+
+    if not env.get("POSTIZ_API_KEY") or not env.get("POSTIZ_BASE_URL"):
+        raise SystemExit(
+            "POSTIZ_API_KEY and POSTIZ_BASE_URL are required. Set them in your environment."
+        )
+
+    image_urls = upload_images(image_paths, env) if image_paths else []
+
+    cmd = _cli_cmd(["posts", "create", "--content", content])
+
+    for ch in integration_ids:
+        cmd.extend(["--integrations", ch])
+
+    cmd.extend(["--status", status])
+
+    if scheduled_date:
+        cmd.extend(["--scheduled-date", scheduled_date])
+
+    for url in image_urls:
+        cmd.extend(["--images", url])
+
+    cmd.append("--pretty")
+
+    res = _run(cmd, env)
+    if res.returncode == 0:
+        print(res.stdout)
+        return True
+
+    print(res.stderr)
+    return False
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Generic Postiz publish helper")
+    parser.add_argument("--content", required=True, help="Post content")
+    parser.add_argument(
+        "--integrations",
+        action="append",
+        default=[],
+        help="Integration/channel id (repeatable)",
+    )
+    parser.add_argument(
+        "--status",
+        default="now",
+        choices=["draft", "scheduled", "now"],
+        help="Post status",
+    )
+    parser.add_argument("--scheduled-date", help="ISO 8601 datetime with offset")
+    parser.add_argument("--images", nargs="*", help="Local image paths")
+
+    args = parser.parse_args()
+
+    if not args.integrations:
+        raise SystemExit("At least one --integrations <id> is required")
+
+    ok = publish(
+        content=args.content,
+        integration_ids=args.integrations,
+        status=args.status,
+        scheduled_date=args.scheduled_date,
+        image_paths=args.images,
+    )
+
+    raise SystemExit(0 if ok else 1)
+
+
+if __name__ == "__main__":
+    main()

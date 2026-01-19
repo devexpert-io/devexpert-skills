@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+import argparse
+import datetime as dt
+import json
+import os
+from collections import defaultdict
+from typing import Optional, List, Dict
+
+from slack_common import api_call, conversation_display_name, get_token
+
+
+def _now_tz():
+    return dt.datetime.now().astimezone().tzinfo
+
+
+def _parse_date(value: str, end: bool) -> Optional[float]:
+    if not value:
+        return None
+    try:
+        if len(value) == 10:
+            date = dt.date.fromisoformat(value)
+            if end:
+                time = dt.time(23, 59, 59, 999000)
+            else:
+                time = dt.time(0, 0, 0)
+            return dt.datetime.combine(date, time, tzinfo=_now_tz()).timestamp()
+        parsed = dt.datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=_now_tz())
+        return parsed.timestamp()
+    except ValueError:
+        raise SystemExit(f"Invalid date: {value}. Use YYYY-MM-DD or ISO datetime.")
+
+
+def _fetch_history(token: str, channel_id: str, oldest: Optional[float], latest: Optional[float]) -> List[Dict]:
+    items = []
+    cursor = None
+    while True:
+        params = {"channel": channel_id, "limit": 200}
+        if oldest is not None:
+            params["oldest"] = oldest
+        if latest is not None:
+            params["latest"] = latest
+        if cursor:
+            params["cursor"] = cursor
+        payload = api_call("conversations.history", token, params)
+        items.extend(payload.get("messages", []))
+        cursor = payload.get("response_metadata", {}).get("next_cursor")
+        if not cursor:
+            break
+    return items
+
+
+def _fetch_thread_replies(token: str, channel_id: str, thread_ts: str, oldest: Optional[float], latest: Optional[float]) -> List[Dict]:
+    items = []
+    cursor = None
+    while True:
+        params = {"channel": channel_id, "ts": thread_ts, "limit": 200}
+        if oldest is not None:
+            params["oldest"] = oldest
+        if latest is not None:
+            params["latest"] = latest
+        if cursor:
+            params["cursor"] = cursor
+        payload = api_call("conversations.replies", token, params)
+        replies = payload.get("messages", [])
+        if replies:
+            items.extend(replies[1:])  # skip parent, already in history
+        cursor = payload.get("response_metadata", {}).get("next_cursor")
+        if not cursor:
+            break
+    return items
+
+
+def _sanitize_dirname(value: str) -> str:
+    value = value.strip().replace("/", "_")
+    return value or "dm"
+
+
+def _group_by_date(messages: List[Dict]) -> Dict[str, List[Dict]]:
+    grouped: Dict[str, List[Dict]] = defaultdict(list)
+    for msg in messages:
+        ts = msg.get("ts")
+        if not ts:
+            continue
+        try:
+            date = dt.datetime.fromtimestamp(float(ts), tz=_now_tz()).date().isoformat()
+        except Exception:
+            continue
+        grouped[date].append(msg)
+    return grouped
+
+
+def _strip_reactions(messages: List[Dict]) -> None:
+    for msg in messages:
+        msg.pop("reactions", None)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Export a Slack DM to Slack-like JSON files.")
+    parser.add_argument("--channel-id", required=True, help="DM channel id (e.g. D0906MST881)")
+    parser.add_argument("--output-dir", required=True, help="Directory to write JSON files")
+    parser.add_argument("--from", dest="date_from", default="", help="Start date (YYYY-MM-DD)")
+    parser.add_argument("--to", dest="date_to", default="", help="End date (YYYY-MM-DD)")
+    parser.add_argument("--include-threads", action="store_true", help="Include thread replies")
+    parser.add_argument("--no-threads", action="store_true", help="Exclude thread replies")
+    args = parser.parse_args()
+
+    include_threads = args.include_threads and not args.no_threads
+    if not args.include_threads and not args.no_threads:
+        include_threads = True
+
+    token = get_token()
+    oldest = _parse_date(args.date_from, end=False)
+    latest = _parse_date(args.date_to, end=True)
+
+    info = api_call("conversations.info", token, {"channel": args.channel_id})
+    channel = info.get("channel", {})
+    display = conversation_display_name(channel, token, {})
+    safe_display = _sanitize_dirname(display.lstrip("@"))
+
+    base_dir = os.path.abspath(args.output_dir)
+    os.makedirs(base_dir, exist_ok=True)
+    out_dir = os.path.join(base_dir, safe_display)
+    os.makedirs(out_dir, exist_ok=True)
+
+    messages = _fetch_history(token, args.channel_id, oldest, latest)
+    if include_threads:
+        seen_ts = {msg.get("ts") for msg in messages if msg.get("ts")}
+        for msg in list(messages):
+            if msg.get("thread_ts") == msg.get("ts") and msg.get("reply_count"):
+                replies = _fetch_thread_replies(token, args.channel_id, msg["thread_ts"], oldest, latest)
+                for reply in replies:
+                    ts = reply.get("ts")
+                    if not ts or ts in seen_ts:
+                        continue
+                    messages.append(reply)
+                    seen_ts.add(ts)
+
+    _strip_reactions(messages)
+    messages.sort(key=lambda m: float(m.get("ts", 0)))
+
+    grouped = _group_by_date(messages)
+    for date, items in grouped.items():
+        path = os.path.join(out_dir, f"{date}.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False, indent=2)
+
+    meta = {
+        "channel_id": args.channel_id,
+        "display_name": display,
+        "range": {"from": args.date_from or None, "to": args.date_to or None},
+        "messages": len(messages),
+        "threads_included": include_threads,
+    }
+    with open(os.path.join(out_dir, "_meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+    print(f"Exported {len(messages)} messages to {out_dir}")
+
+
+if __name__ == "__main__":
+    main()
