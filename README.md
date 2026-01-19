@@ -34,7 +34,3 @@ Package (optional):
 - Skills live at `skills/<name>/SKILL.md` and may include `scripts/`, `references/`, `assets/`.
 - `skills/private/` is ignored by git.
 - Secrets (OAuth client_secret.json, API keys, etc.) should live under `~/.config/skills/`.
-
-## Worktree helper skill
-
-The worktree helper skill is now located at `skills/worktree-helper/`.
