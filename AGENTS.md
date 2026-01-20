@@ -81,9 +81,6 @@ Antonio owns this.
 - Unrecognized changes: assume other agent; keep going; focus your changes. If it causes issues, stop + ask user.
 - Leave breadcrumb notes in thread.
 
-## Notes
-- Torrents: if a torrent file is received, open it with Folx.
-
 ## Tools
 
 ### trash
@@ -99,6 +96,10 @@ Antonio owns this.
 
 - GitHub CLI for PRs/CI/releases. Given issue/PR URL (or `/pull/5`): use `gh`, not web search.
 - Examples: `gh issue view <url> --comments -R owner/repo`, `gh pr view <url> --comments --files -R owner/repo`.
+
+### mcporter
+
+- MCP launcher: `mcporter <server>` (see `npx mcporter --help`)
 
 ### tmux
 
