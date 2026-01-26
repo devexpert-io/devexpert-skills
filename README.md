@@ -16,6 +16,7 @@ A curated catalog of Agent Skills plus supporting docs, scripts, and assets.
 - **devexpert-testimonials** — Import DevExpert testimonials from Google Sheets (gog) or pasted TSV lists, format text with line breaks, crop profile images to 400x400, copy them to src/assets/testimonials, update src/data/testimonials.json, and optionally update AI Expert IDs.
 - **email** — Manage inbox email. Uses the inbox script and stores metadata (ids) to open or archive messages later.
 - **google-chat** — Read Google Chat spaces/threads via the Chat API, create/refresh OAuth tokens, parse Gmail Chat URLs, and list spaces.
+- **grok-research** — Investiga temas de actualidad con Grok 4.1 vía OpenRouter y genera un informe en Markdown con timeline, claims verificables y fuentes.
 - **holded-invoices** — Process invoice emails: download PDF attachments, extract vendor + date, generate normalized filename, and send to Holded inbox via n8n webhook.
 - **justdoit** — Manage tasks via the justdoit CLI (Google Tasks + Calendar): next view, list, search, complete/undo, and common workflows.
 - **morning-routine** — Orchestrates a full morning sweep of pending items (email, tasks, Slack, WhatsApp, X).
