@@ -40,6 +40,7 @@ Antonio owns this.
 - Follow links until domain makes sense; honor `Read when` hints.
 - Keep notes short; update docs when behavior/API changes (no ship w/o docs).
 - Add `read_when` hints on cross-cutting docs.
+- When creating new skills, write the skill content in English (including `SKILL.md`).
 
 ## PR Feedback
 

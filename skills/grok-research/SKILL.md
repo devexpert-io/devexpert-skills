@@ -1,51 +1,51 @@
 ---
 name: grok-research
-description: "Investiga temas de actualidad con Grok 4.1 vía OpenRouter y genera un informe en Markdown con línea temporal, claims verificables y fuentes (web/X). Úsala cuando necesites research rápido y contrastado (noticias, rumores, cambios de producto/política, contexto competitivo)."
+description: "Investigate a topic with Grok 4.1 via OpenRouter and generate a Markdown report with a timeline, verifiable claims, and sources (web/X). Use it when the user says “investiga…”, “haz research…”, “averigua…”, “búscame fuentes…”, “research…”, “look into…”, or when you need fast, source-backed research (news, rumors, product/policy changes, competitive context)."
 ---
 
-# Grok research (OpenRouter + Grok 4.1)
+# Grok Research (OpenRouter + Grok 4.1)
 
-Esta skill automatiza un “deep dive” sobre un tema reciente usando Grok 4.1 a través de OpenRouter, devolviendo un informe en Markdown con fuentes.
+This skill automates a source-backed “deep dive” on a recent topic using Grok 4.1 via OpenRouter. Output is a Markdown report with citations.
 
 ## Quick start
 
-1) Exporta la API key en entorno:
+1) Export the API key:
 
 ```bash
 export OPENROUTER_API_KEY="..."
 ```
 
-2) Ejecuta el script:
+2) Run the script:
 
 ```bash
-node skills/grok-research/scripts/grok-research.js --topic "Qué está pasando con …" --out report.md
+node skills/grok-research/scripts/grok-research.js --topic "What's going on with …" --out report.md
 ```
 
-Por defecto intenta usar `x-ai/grok-4.1-fast:online`. Si tu cuenta/modelo usa otro nombre, pasa `--model` o define `GROK_RESEARCH_MODEL`.
+By default it tries to use `x-ai/grok-4.1-fast:online`. If your account/model uses a different id, pass `--model` or set `GROK_RESEARCH_MODEL`.
 
-## Variables de entorno
+## Environment variables
 
-- `OPENROUTER_API_KEY` (requerida)
-- `GROK_RESEARCH_MODEL` (opcional) (default: `x-ai/grok-4.1-fast:online`)
-- `OPENROUTER_SITE_URL` (opcional) (header recomendado por OpenRouter)
-- `OPENROUTER_APP_NAME` (opcional) (header recomendado por OpenRouter)
+- `OPENROUTER_API_KEY` (required)
+- `GROK_RESEARCH_MODEL` (optional) (default: `x-ai/grok-4.1-fast:online`)
+- `OPENROUTER_SITE_URL` (optional) (recommended header by OpenRouter)
+- `OPENROUTER_APP_NAME` (optional) (recommended header by OpenRouter)
 
-## Flags útiles (script)
+## Useful flags (script)
 
-- `--topic "..."`: tema a investigar (o primer argumento posicional)
-- `--out report.md`: guarda el informe y escribe la ruta resultante por stdout
-- `--model <id>`: fuerza el modelo de OpenRouter
-- `--max-tokens 2200`, `--temperature 0.2`: control de longitud/estilo
+- `--topic "..."`: topic to research (or first positional argument)
+- `--out report.md`: saves the report and prints the resulting path to stdout
+- `--model <id>`: forces the OpenRouter model id
+- `--max-tokens 2200`, `--temperature 0.2`: length/style controls
 
-## Workflow recomendado (agente)
+## Recommended workflow (agent)
 
-1) Clarifica el objetivo: “¿quieres un resumen ejecutivo o un informe para tomar decisiones?”
-2) Pide constraints: país/idioma, horizonte temporal (últimas 24/72h), y si hay afirmaciones concretas a verificar.
-3) Ejecuta `scripts/grok-research.js` y revisa el bloque **Claims y verificación**:
-   - Si faltan fuentes, re-lanza con un `--max-tokens` mayor o ajusta el topic para ser más específico.
-4) Si el tema es sensible/controvertido, pide al modelo que liste hipótesis alternativas y qué evidencia faltaría para confirmarlas.
+1) Clarify the goal: “do you want an executive summary or a decision-making report?”
+2) Ask for constraints: country/language, time window (last 24/72h), and any specific claims to verify.
+3) Run `scripts/grok-research.js` and review the **Claims & verification** section:
+   - If sources are weak/missing, re-run with higher `--max-tokens` or narrow the topic.
+4) If the topic is sensitive/controversial, ask the model to list alternative hypotheses and what evidence would falsify/confirm each.
 
-## Recursos
+## Resources
 
-- Script principal: `scripts/grok-research.js`
-- Notas API: `references/api_reference.md`
+- Main script: `scripts/grok-research.js`
+- API notes: `references/api_reference.md`
